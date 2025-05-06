@@ -1,0 +1,29 @@
+{
+    "name": "itcom/jarl-log-xml-parser",
+    "description": "A simple parser for JARL SUMMARYSHEET and LOGSHEET XML formats",
+    "type": "library",
+    "require": {
+        "php": ">=8.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.0"
+    },
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Itcom\\JarlLog\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Itcom\\JarlLog\\Tests\\": "tests/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Atsuji Okuyama",
+            "email": "okuyama@workgroup.jp"
+        }
+    ],
+    "minimum-stability": "stable"
+}
