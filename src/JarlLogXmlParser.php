@@ -2,6 +2,8 @@
 
 namespace Itcom\JarlLog;
 
+use Illuminate\Support\Facades\Log;
+
 class JarlLogXmlParser
 {
     /**
@@ -42,6 +44,7 @@ class JarlLogXmlParser
             $content = trim($m2[1] ?? '');
             $lines = preg_split('/\r?\n/', $content);
             array_shift($lines); // remove header
+            Log::debug($lines);
 
             // Pattern captures optional sentNo and rcvNo correctly regardless of content
             $pattern = '/^
@@ -77,6 +80,8 @@ class JarlLogXmlParser
                         'mlt'      => $f['mlt'],
                         'pts'      => $f['pts'],
                     ];
+                } else {
+                    Log::warning("Failed to parse log line: {$line}");
                 }
             }
         }
