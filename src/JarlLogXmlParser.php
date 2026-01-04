@@ -98,12 +98,10 @@ class JarlLogXmlParser
         ];
 
         $columns = [];
-        // 長い名前を先にマッチさせるため、名前の長さでソート
         $sortedMap = $columnMap;
         uksort($sortedMap, fn($a, $b) => strlen($b) <=> strlen($a));
 
         foreach ($sortedMap as $headerName => $fieldKey) {
-            // 既にこのフィールドが見つかっていたらスキップ
             if (isset($columns[$fieldKey])) {
                 continue;
             }
@@ -125,16 +123,24 @@ class JarlLogXmlParser
             $mltActualStart = self::detectMltPosition($dataLines);
         }
 
+        // Mltの実際の開始位置が検出できた場合、mltとptsのstartを更新
+        if ($mltActualStart !== null && isset($columns['mlt'])) {
+            $mltShift = $mltActualStart - $columns['mlt']['start'];
+            $columns['mlt']['start'] = $mltActualStart;
+            // ptsも同じ分だけシフト
+            if (isset($columns['pts'])) {
+                $columns['pts']['start'] += $mltShift;
+            }
+        }
+
+        // キーを再ソート（start位置が変わった可能性があるため）
+        $keys = array_keys($columns);
+        usort($keys, fn($a, $b) => $columns[$a]['start'] <=> $columns[$b]['start']);
+
         for ($i = 0; $i < count($keys) - 1; $i++) {
             $currentKey = $keys[$i];
             $nextKey = $keys[$i + 1];
-
-            // rcvカラムの場合、データ行から検出したMlt位置を使用
-            if ($currentKey === 'rcv' && $mltActualStart !== null) {
-                $columns[$currentKey]['len'] = $mltActualStart - $columns[$currentKey]['start'];
-            } else {
-                $columns[$currentKey]['len'] = $columns[$nextKey]['start'] - $columns[$currentKey]['start'];
-            }
+            $columns[$currentKey]['len'] = $columns[$nextKey]['start'] - $columns[$currentKey]['start'];
         }
 
         if (count($keys) > 0) {
