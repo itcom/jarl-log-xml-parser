@@ -24,26 +24,31 @@ class JarlLogXmlParser
             }
         }
 
-        // Parse LOGSHEET using fixed-width columns (byte-based, before UTF-8 conversion)
-        if (preg_match('/<LOGSHEET\b[^>]*>(.*?)<\/LOGSHEET>/si', $rawText, $m2)) {
+        // Parse LOGSHEET using fixed-width columns
+        if (preg_match('/<LOGSHEET\b[^>]*>(.*?)<\/LOGSHEET>/si', $utf8Text, $m2)) {
             $content = trim($m2[1] ?? '');
             $lines = preg_split('/\r?\n/', $content);
 
-            // Get header line and determine column positions (byte-based)
+            // Get header line and determine column positions
             $headerLine = array_shift($lines);
-            $columns = self::parseHeaderPositions($headerLine);
+
+            // 有効なデータ行を収集
+            $dataLines = [];
+            foreach ($lines as $line) {
+                if (trim($line) !== '' && strpos($line, '---') !== 0) {
+                    $dataLines[] = $line;
+                }
+            }
+
+            $columns = self::parseHeaderPositions($headerLine, $dataLines);
 
             if (empty($columns)) {
                 Log::warning("Failed to parse LOGSHEET header: {$headerLine}");
                 return $result;
             }
 
-            foreach ($lines as $line) {
-                if (trim($line) === '' || strpos($line, '---') === 0) {
-                    continue;
-                }
-
-                $row = self::extractFixedWidthFields($line, $columns, $encoding);
+            foreach ($dataLines as $line) {
+                $row = self::extractFixedWidthFields($line, $columns);
                 if ($row) {
                     $result['logs'][] = $row;
                 } else {
@@ -64,9 +69,10 @@ class JarlLogXmlParser
     }
 
     /**
-     * Parse header line to get column positions (byte-based)
+     * Parse header line to get column positions
+     * データ行の末尾から逆算してカラム幅を決定
      */
-    private static function parseHeaderPositions(string $headerLine): array
+    private static function parseHeaderPositions(string $headerLine, array $dataLines = []): array
     {
         $columnMap = [
             'DATE(JST)' => 'date',
@@ -101,11 +107,11 @@ class JarlLogXmlParser
             if (isset($columns[$fieldKey])) {
                 continue;
             }
-            $pos = strpos($headerLine, $headerName);
+            $pos = mb_strpos($headerLine, $headerName);
             if ($pos !== false) {
                 $columns[$fieldKey] = [
                     'start' => $pos,
-                    'len'   => strlen($headerName),
+                    'len'   => mb_strlen($headerName),
                 ];
             }
         }
@@ -113,11 +119,24 @@ class JarlLogXmlParser
         $keys = array_keys($columns);
         usort($keys, fn($a, $b) => $columns[$a]['start'] <=> $columns[$b]['start']);
 
+        // データ行からMltの実際の開始位置を検出
+        $mltActualStart = null;
+        if (!empty($dataLines)) {
+            $mltActualStart = self::detectMltPosition($dataLines);
+        }
+
         for ($i = 0; $i < count($keys) - 1; $i++) {
             $currentKey = $keys[$i];
             $nextKey = $keys[$i + 1];
-            $columns[$currentKey]['len'] = $columns[$nextKey]['start'] - $columns[$currentKey]['start'];
+
+            // rcvカラムの場合、データ行から検出したMlt位置を使用
+            if ($currentKey === 'rcv' && $mltActualStart !== null) {
+                $columns[$currentKey]['len'] = $mltActualStart - $columns[$currentKey]['start'];
+            } else {
+                $columns[$currentKey]['len'] = $columns[$nextKey]['start'] - $columns[$currentKey]['start'];
+            }
         }
+
         if (count($keys) > 0) {
             $lastKey = $keys[count($keys) - 1];
             $columns[$lastKey]['len'] = 20;
@@ -127,20 +146,37 @@ class JarlLogXmlParser
     }
 
     /**
-     * Extract fields from a fixed-width line (byte-based, then convert to UTF-8)
+     * データ行からMltカラムの実際の開始位置を検出
+     * 末尾パターン: [空白][Mlt値][空白][Pts値]
      */
-    private static function extractFixedWidthFields(string $line, array $columns, ?string $encoding): ?array
+    private static function detectMltPosition(array $dataLines): ?int
     {
-        $get = function ($key) use ($line, $columns, $encoding) {
+        foreach ($dataLines as $line) {
+            // 末尾のパターンを検出: "   -       0" や "   1       5" など
+            // Mlt値(-, 数字等) と Pts値(数字) のパターン
+            if (preg_match('/\s+([^\s]+)\s+(\d+)\s*$/u', $line, $match, PREG_OFFSET_CAPTURE)) {
+                // $match[1][1] がMlt値の開始バイト位置
+                // 表示幅位置に変換するため、その前の文字列の表示幅を計算
+                $prefix = substr($line, 0, $match[1][1]);
+                return mb_strwidth($prefix, 'UTF-8');
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Extract fields from a fixed-width line (display-width-based)
+     */
+    private static function extractFixedWidthFields(string $line, array $columns): ?array
+    {
+        $get = function ($key) use ($line, $columns) {
             if (!isset($columns[$key])) {
                 return '';
             }
-            $start = $columns[$key]['start'];
-            $len = $columns[$key]['len'];
-            // Use substr for byte-based extraction
-            $value = trim(substr($line, $start, $len));
-            // Convert extracted value to UTF-8
-            return self::convertToUtf8($value, $encoding);
+            $startWidth = $columns[$key]['start'];
+            $widthLen = $columns[$key]['len'];
+
+            return trim(self::extractByDisplayWidth($line, $startWidth, $widthLen));
         };
 
         $date = $get('date');
@@ -159,14 +195,14 @@ class JarlLogXmlParser
 
         $sentRst = '';
         $sentNo = '';
-        if (preg_match('/^(\d{2,3})\s*(.*)$/u', $sent, $sm)) {
+        if (preg_match('/^([+-]?\d{2,3})\s*(.*)$/u', $sent, $sm)) {
             $sentRst = $sm[1];
             $sentNo = trim($sm[2]);
         }
 
         $rcvRst = '';
         $rcvNo = '';
-        if (preg_match('/^(\d{2,3})\s*(.*)$/u', $rcv, $rm)) {
+        if (preg_match('/^([+-]?\d{2,3})\s*(.*)$/u', $rcv, $rm)) {
             $rcvRst = $rm[1];
             $rcvNo = trim($rm[2]);
         }
@@ -184,5 +220,16 @@ class JarlLogXmlParser
             'mlt'      => $mlt,
             'pts'      => $pts,
         ];
+    }
+
+    /**
+     * 表示幅ベースで文字列を切り出す
+     */
+    private static function extractByDisplayWidth(string $str, int $startWidth, int $widthLen): string
+    {
+        $prefix = mb_strimwidth($str, 0, $startWidth, '', 'UTF-8');
+        $offset = strlen($prefix);
+        $remainder = substr($str, $offset);
+        return mb_strimwidth($remainder, 0, $widthLen, '', 'UTF-8');
     }
 }
