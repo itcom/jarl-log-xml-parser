@@ -211,6 +211,14 @@ class JarlLogXmlParser
         if (preg_match('/^([+-]?\d{2,3})\s*(.*)$/u', $rcv, $rm)) {
             $rcvRst = $rm[1];
             $rcvNo = trim($rm[2]);
+            // 末尾にMlt値（スペース+非空白文字列）が混入している場合は除去してMltに適用
+            if (preg_match('/^(.+?)\s+(\S+)$/u', $rcvNo, $mltMatch)) {
+                $rcvNo = trim($mltMatch[1]);
+                // Mltが空または未設定の場合のみ適用
+                if ($mlt === '' || $mlt === '-') {
+                    $mlt = $mltMatch[2];
+                }
+            }
         }
 
         return [
