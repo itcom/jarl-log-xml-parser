@@ -17,9 +17,14 @@ class JarlLogXmlParser
         $utf8Text = self::convertToUtf8($rawText, $encoding);
         if (preg_match('/<SUMMARYSHEET\b[^>]*>(.*?)<\/SUMMARYSHEET>/si', $utf8Text, $m)) {
             $block = $m[1] ?? '';
-            if (preg_match_all('/<([A-Z]+)>([^<]*)<\/\1>/i', $block, $matches, PREG_SET_ORDER)) {
+            if (preg_match_all('/<([A-Za-z]+)>([^<]*)<\/\1>/i', $block, $matches, PREG_SET_ORDER)) {
                 foreach ($matches as $node) {
-                    $result['summary'][strtolower($node[1])] = trim($node[2]);
+                    $key = strtolower($node[1]);
+                    // <n> タグは name としてマッピング
+                    if ($key === 'n') {
+                        $key = 'name';
+                    }
+                    $result['summary'][$key] = trim($node[2]);
                 }
             }
         }
@@ -86,9 +91,8 @@ class JarlLogXmlParser
             'CALLSIGN'  => 'callsign',
             'SENTNo'    => 'sent',
             'SENT'      => 'sent',
-            'RCVDNo'    => 'rcv',   // CTESTWIN形式
-            'RCVNo'     => 'rcv',   // HLTST形式
-            'RCV'       => 'rcv',
+            'RCVDNo'    => 'rcv',   // CTESTWIN形式（固定幅で取得）
+            // 'RCVNo', 'RCV' => HLTST形式では動的取得するためマッピングしない
             'Multi'     => 'mlt',
             'Mlt'       => 'mlt',   // CTESTWIN形式
             'MLT'       => 'mlt',
@@ -175,14 +179,32 @@ class JarlLogXmlParser
      */
     private static function extractFixedWidthFields(string $line, array $columns): ?array
     {
-        $get = function ($key) use ($line, $columns) {
+        // 末尾からMultiとPTを先に抽出（HLTST形式で日本語名によりカラム位置がずれる対策）
+        // CTESTWIN形式（rcvカラムがある）は固定幅で取得できるので末尾除去不要
+        $mlt = '';
+        $pts = '';
+        $lineForFixedWidth = $line;
+        $useTrailExtraction = !isset($columns['rcv']); // RCVカラムがない場合のみ末尾抽出
+
+        if ($useTrailExtraction && isset($columns['mlt']) && isset($columns['pts'])) {
+            // 末尾パターン: [空白][Multi値(-か*のみ)][空白][PT値][空白]
+            // 注意: [^\s]+ ではなく [-*] に限定（日本語名にくっついた場合の誤認識防止）
+            if (preg_match('/\s+([-*])\s+(\d+)\s*$/u', $line, $tailMatch)) {
+                $mlt = trim($tailMatch[1]);
+                $pts = trim($tailMatch[2]);
+                // 末尾部分を除去した行で固定幅処理
+                $lineForFixedWidth = preg_replace('/\s+[-*]\s+\d+\s*$/u', '', $line);
+            }
+        }
+
+        $get = function ($key) use ($lineForFixedWidth, $columns) {
             if (!isset($columns[$key])) {
                 return '';
             }
             $startWidth = $columns[$key]['start'];
             $widthLen = $columns[$key]['len'];
 
-            return trim(self::extractByDisplayWidth($line, $startWidth, $widthLen));
+            return trim(self::extractByDisplayWidth($lineForFixedWidth, $startWidth, $widthLen));
         };
 
         $date = $get('date');
@@ -191,9 +213,41 @@ class JarlLogXmlParser
         $mode = $get('mode');
         $callsign = $get('callsign');
         $sent = $get('sent');
-        $rcv = $get('rcv');
-        $mlt = $get('mlt');
-        $pts = $get('pts');
+
+        // RCVの取得
+        $rcv = '';
+        if (isset($columns['rcv'])) {
+            // CTESTWIN形式: RCVカラムが定義されている場合は固定幅で取得
+            $rcv = $get('rcv');
+        } elseif (isset($columns['sent'])) {
+            // HLTST形式: SENTとRCVが連続、末尾にMulti/PTが含まれている可能性
+            // 末尾抽出では日本語名にMulti記号がくっついた場合に誤認識するため、一括パターンで抽出
+            $combined = trim(self::extractByDisplayWidth($line, $columns['sent']['start'], 100));
+            
+            // パターン1: [SENT_RST][sp][SENT_Name][RCV_RST][sp][RCV_Name][Multi][sp][PT]
+            // 例: "59  いたばし59  やまぐち-      1"
+            if (preg_match('/^([+-]?\d{2,3})\s+(.+?)([+-]?\d{2,3})\s+(.+?)([-*]|\d{1,3})\s+(\d+)\s*$/u', $combined, $splitMatch)) {
+                $sent = $splitMatch[1] . '  ' . trim($splitMatch[2]);
+                $rcv = $splitMatch[3] . '  ' . trim($splitMatch[4]);
+                $mlt = $splitMatch[5];
+                $pts = $splitMatch[6];
+            }
+            // パターン2: Multi/PTが既に末尾抽出されている場合（スペース区切りあり）
+            elseif (preg_match('/^([+-]?\d{2,3})\s+(.+?)([+-]?\d{2,3})\s+(.+)$/u', $combined, $splitMatch)) {
+                $sent = $splitMatch[1] . '  ' . trim($splitMatch[2]);
+                $rcv = $splitMatch[3] . '  ' . trim($splitMatch[4]);
+            } else {
+                // 分割できない場合は全体をSENTとする
+                $sent = $combined;
+                $rcv = '';
+            }
+        }
+
+        // Multi/PTが末尾抽出されていない場合は固定幅で取得
+        if (!$useTrailExtraction || !isset($columns['mlt']) || !isset($columns['pts'])) {
+            $mlt = $get('mlt');
+            $pts = $get('pts');
+        }
 
         if (empty($date) || empty($callsign)) {
             return null;
@@ -211,14 +265,6 @@ class JarlLogXmlParser
         if (preg_match('/^([+-]?\d{2,3})\s*(.*)$/u', $rcv, $rm)) {
             $rcvRst = $rm[1];
             $rcvNo = trim($rm[2]);
-            // 末尾にMlt値（スペース+非空白文字列）が混入している場合は除去してMltに適用
-            if (preg_match('/^(.+?)\s+(\S+)$/u', $rcvNo, $mltMatch)) {
-                $rcvNo = trim($mltMatch[1]);
-                // Mltが空または未設定の場合のみ適用
-                if ($mlt === '' || $mlt === '-') {
-                    $mlt = $mltMatch[2];
-                }
-            }
         }
 
         return [
