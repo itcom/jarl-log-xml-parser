@@ -45,14 +45,16 @@ class JarlLogXmlParser
                 }
             }
 
-            // タブ区切りか固定幅かを判定
+            // タブ区切り、カンマ区切り、固定幅かを判定
             $isTabDelimited = strpos($headerLine, "\t") !== false;
+            $isCsvDelimited = !$isTabDelimited && strpos($headerLine, ',') !== false;
 
-            if ($isTabDelimited) {
-                // タブ区切り形式
-                $headerColumns = self::parseTabDelimitedHeader($headerLine);
+            if ($isTabDelimited || $isCsvDelimited) {
+                // 区切り文字形式（タブまたはカンマ）
+                $delimiter = $isTabDelimited ? "\t" : ',';
+                $headerColumns = self::parseDelimitedHeader($headerLine, $delimiter);
                 foreach ($dataLines as $line) {
-                    $row = self::extractTabDelimitedFields($line, $headerColumns);
+                    $row = self::extractDelimitedFields($line, $headerColumns, $delimiter);
                     if ($row) {
                         $result['logs'][] = $row;
                     } else {
@@ -119,6 +121,7 @@ class JarlLogXmlParser
             'ExRcvd'    => 'rcvNo',
             // マルチ/ポイント
             'Multi'     => 'mlt',
+            'Mult2'     => 'mlt2',  // ZLOG形式（位置計算用）
             'Mult'      => 'mlt',   // ZLOG形式
             'Mlt'       => 'mlt',   // CTESTWIN形式
             'MLT'       => 'mlt',
@@ -149,8 +152,10 @@ class JarlLogXmlParser
         usort($keys, fn($a, $b) => $columns[$a]['start'] <=> $columns[$b]['start']);
 
         // データ行からMltの実際の開始位置を検出
+        // ZLOG形式（sentRst/rcvRstカラムがある）は末尾パターンが異なるためスキップ
+        $isZlogFormat = isset($columns['sentRst']) && isset($columns['rcvRst']);
         $mltActualStart = null;
-        if (!empty($dataLines)) {
+        if (!empty($dataLines) && !$isZlogFormat) {
             $mltActualStart = self::detectMltPosition($dataLines);
         }
 
@@ -241,6 +246,43 @@ class JarlLogXmlParser
         $callsign = $get('callsign');
         $sent = $get('sent');
 
+        // ZLOG形式: RSTとNoが別カラムの場合は直接取得
+        $isZlogFormat = isset($columns['sentRst']) && isset($columns['rcvRst']);
+        if ($isZlogFormat) {
+            $sentRst = $get('sentRst');
+            $sentNo = $get('sentNo');
+            $rcvRst = $get('rcvRst');
+            $rcvNo = $get('rcvNo');
+            $mlt = $get('mlt');
+            $pts = $get('pts');
+
+            // 日本語名がカラム幅を超えてMult領域に侵食する場合がある
+            // Multの値がNoの末尾にくっついていたら除去（スペースを挟んでいても）
+            if ($mlt !== '') {
+                $pattern = '/\s*' . preg_quote($mlt, '/') . '\s*$/u';
+                $sentNo = preg_replace($pattern, '', $sentNo);
+                $rcvNo = preg_replace($pattern, '', $rcvNo);
+            }
+
+            if (empty($date) || empty($callsign)) {
+                return null;
+            }
+
+            return [
+                'date'     => $date,
+                'time'     => $time,
+                'band'     => $band,
+                'mode'     => $mode,
+                'callsign' => $callsign,
+                'sentRst'  => $sentRst,
+                'sentNo'   => $sentNo,
+                'rcvRst'   => $rcvRst,
+                'rcvNo'    => $rcvNo,
+                'mlt'      => $mlt,
+                'pts'      => $pts,
+            ];
+        }
+
         // SENT+RCVの取得（CTESTWIN/HLTST両方で日本語文字により固定幅抽出がずれるため、一括パターンで抽出）
         $rcv = '';
         if (isset($columns['sent'])) {
@@ -324,9 +366,9 @@ class JarlLogXmlParser
     }
 
     /**
-     * タブ区切りヘッダーをパース
+     * 区切り文字形式のヘッダーをパース
      */
-    private static function parseTabDelimitedHeader(string $headerLine): array
+    private static function parseDelimitedHeader(string $headerLine, string $delimiter = "\t"): array
     {
         $columnMap = [
             'DATE(JST)' => 'date',
@@ -353,7 +395,7 @@ class JarlLogXmlParser
             'PTS'       => 'pts',
         ];
 
-        $headers = explode("\t", $headerLine);
+        $headers = explode($delimiter, $headerLine);
         $result = [];
 
         foreach ($headers as $index => $header) {
@@ -367,11 +409,11 @@ class JarlLogXmlParser
     }
 
     /**
-     * タブ区切り行からフィールドを抽出
+     * 区切り文字形式の行からフィールドを抽出
      */
-    private static function extractTabDelimitedFields(string $line, array $headerColumns): ?array
+    private static function extractDelimitedFields(string $line, array $headerColumns, string $delimiter = "\t"): ?array
     {
-        $fields = explode("\t", $line);
+        $fields = explode($delimiter, $line);
 
         $get = function ($key) use ($fields, $headerColumns) {
             if (!isset($headerColumns[$key])) {
@@ -393,11 +435,16 @@ class JarlLogXmlParser
         // TIMEの末尾のJを除去（elog形式: "07:48J" -> "07:48"）
         $time = preg_replace('/J$/i', '', $time);
 
-        // DATE形式の変換: "26/01/02" -> "2026-01-02"
+        // DATE形式の変換
+        // パターン1: "26/01/02" -> "2026-01-02"
         if (preg_match('/^(\d{2})\/(\d{2})\/(\d{2})$/', $date, $dm)) {
             $year = (int)$dm[1];
             $year = $year < 50 ? 2000 + $year : 1900 + $year;
             $date = sprintf('%04d-%02d-%02d', $year, (int)$dm[2], (int)$dm[3]);
+        }
+        // パターン2: "2026/1/2" -> "2026-01-02"
+        elseif (preg_match('/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/', $date, $dm)) {
+            $date = sprintf('%04d-%02d-%02d', (int)$dm[1], (int)$dm[2], (int)$dm[3]);
         }
 
         if (empty($date) || empty($callsign)) {
