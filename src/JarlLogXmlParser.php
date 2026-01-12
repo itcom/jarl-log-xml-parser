@@ -29,7 +29,7 @@ class JarlLogXmlParser
             }
         }
 
-        // Parse LOGSHEET using fixed-width columns
+        // Parse LOGSHEET using fixed-width columns or tab-delimited
         if (preg_match('/<LOGSHEET\b[^>]*>(.*?)<\/LOGSHEET>/si', $utf8Text, $m2)) {
             $content = trim($m2[1] ?? '');
             $lines = preg_split('/\r?\n/', $content);
@@ -45,19 +45,36 @@ class JarlLogXmlParser
                 }
             }
 
-            $columns = self::parseHeaderPositions($headerLine, $dataLines);
+            // タブ区切りか固定幅かを判定
+            $isTabDelimited = strpos($headerLine, "\t") !== false;
 
-            if (empty($columns)) {
-                Log::warning("Failed to parse LOGSHEET header: {$headerLine}");
-                return $result;
-            }
+            if ($isTabDelimited) {
+                // タブ区切り形式
+                $headerColumns = self::parseTabDelimitedHeader($headerLine);
+                foreach ($dataLines as $line) {
+                    $row = self::extractTabDelimitedFields($line, $headerColumns);
+                    if ($row) {
+                        $result['logs'][] = $row;
+                    } else {
+                        Log::warning("Failed to parse log line: {$line}");
+                    }
+                }
+            } else {
+                // 固定幅形式
+                $columns = self::parseHeaderPositions($headerLine, $dataLines);
 
-            foreach ($dataLines as $line) {
-                $row = self::extractFixedWidthFields($line, $columns);
-                if ($row) {
-                    $result['logs'][] = $row;
-                } else {
-                    Log::warning("Failed to parse log line: {$line}");
+                if (empty($columns)) {
+                    Log::warning("Failed to parse LOGSHEET header: {$headerLine}");
+                    return $result;
+                }
+
+                foreach ($dataLines as $line) {
+                    $row = self::extractFixedWidthFields($line, $columns);
+                    if ($row) {
+                        $result['logs'][] = $row;
+                    } else {
+                        Log::warning("Failed to parse log line: {$line}");
+                    }
                 }
             }
         }
@@ -83,20 +100,30 @@ class JarlLogXmlParser
             'DATE(JST)' => 'date',
             'DATE (JST)' => 'date',  // スペースあり版も追加
             'DATE'      => 'date',
+            'Date'      => 'date',   // ZLOG形式
             'TIME'      => 'time',
+            'Time'      => 'time',   // ZLOG形式
             'BAND'      => 'band',
             'MHz'       => 'band',
             'Mode'      => 'mode',
             'MODE'      => 'mode',
             'CALLSIGN'  => 'callsign',
+            'Callsign'  => 'callsign', // ZLOG形式
             'SENTNo'    => 'sent',
             'SENT'      => 'sent',
             'RCVDNo'    => 'rcv',   // CTESTWIN形式（固定幅で取得）
-            // 'RCVNo', 'RCV' => HLTST形式では動的取得するためマッピングしない
+            // ZLOG形式: RSTとNoが別カラム
+            'RSTs'      => 'sentRst',
+            'ExSent'    => 'sentNo',
+            'RSTr'      => 'rcvRst',
+            'ExRcvd'    => 'rcvNo',
+            // マルチ/ポイント
             'Multi'     => 'mlt',
+            'Mult'      => 'mlt',   // ZLOG形式
             'Mlt'       => 'mlt',   // CTESTWIN形式
             'MLT'       => 'mlt',
             'PT'        => 'pts',
+            'Pt'        => 'pts',   // ZLOG形式
             'Pts'       => 'pts',   // CTESTWIN形式
             'PTS'       => 'pts',
         ];
@@ -294,5 +321,116 @@ class JarlLogXmlParser
         $offset = strlen($prefix);
         $remainder = substr($str, $offset);
         return mb_strimwidth($remainder, 0, $widthLen, '', 'UTF-8');
+    }
+
+    /**
+     * タブ区切りヘッダーをパース
+     */
+    private static function parseTabDelimitedHeader(string $headerLine): array
+    {
+        $columnMap = [
+            'DATE(JST)' => 'date',
+            'DATE'      => 'date',
+            'TIME'      => 'time',
+            'BAND'      => 'band',
+            'MHz'       => 'band',
+            'Mode'      => 'mode',
+            'MODE'      => 'mode',
+            'CALLSIGN'  => 'callsign',
+            'SENTNo.'   => 'sent',
+            'SENTNo'    => 'sent',
+            'SENT'      => 'sent',
+            'RCVDNo.'   => 'rcv',
+            'RCVDNo'    => 'rcv',
+            'RCVNo.'    => 'rcv',
+            'RCVNo'     => 'rcv',
+            'Multi'     => 'mlt',
+            'Mlt'       => 'mlt',
+            'MLT'       => 'mlt',
+            'PT'        => 'pts',
+            'Pt'        => 'pts',
+            'Pts'       => 'pts',
+            'PTS'       => 'pts',
+        ];
+
+        $headers = explode("\t", $headerLine);
+        $result = [];
+
+        foreach ($headers as $index => $header) {
+            $header = trim($header);
+            if (isset($columnMap[$header])) {
+                $result[$columnMap[$header]] = $index;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * タブ区切り行からフィールドを抽出
+     */
+    private static function extractTabDelimitedFields(string $line, array $headerColumns): ?array
+    {
+        $fields = explode("\t", $line);
+
+        $get = function ($key) use ($fields, $headerColumns) {
+            if (!isset($headerColumns[$key])) {
+                return '';
+            }
+            return trim($fields[$headerColumns[$key]] ?? '');
+        };
+
+        $date = $get('date');
+        $time = $get('time');
+        $band = $get('band');
+        $mode = $get('mode');
+        $callsign = $get('callsign');
+        $sent = $get('sent');
+        $rcv = $get('rcv');
+        $mlt = $get('mlt');
+        $pts = $get('pts');
+
+        // TIMEの末尾のJを除去（elog形式: "07:48J" -> "07:48"）
+        $time = preg_replace('/J$/i', '', $time);
+
+        // DATE形式の変換: "26/01/02" -> "2026-01-02"
+        if (preg_match('/^(\d{2})\/(\d{2})\/(\d{2})$/', $date, $dm)) {
+            $year = (int)$dm[1];
+            $year = $year < 50 ? 2000 + $year : 1900 + $year;
+            $date = sprintf('%04d-%02d-%02d', $year, (int)$dm[2], (int)$dm[3]);
+        }
+
+        if (empty($date) || empty($callsign)) {
+            return null;
+        }
+
+        // SENT/RCVからRSTとNoを分離（elog形式: "56タバラ" -> RST=56, No=タバラ）
+        $sentRst = '';
+        $sentNo = '';
+        if (preg_match('/^([+-]?\d{2,3})(.*)$/u', $sent, $sm)) {
+            $sentRst = $sm[1];
+            $sentNo = trim($sm[2]);
+        }
+
+        $rcvRst = '';
+        $rcvNo = '';
+        if (preg_match('/^([+-]?\d{2,3})(.*)$/u', $rcv, $rm)) {
+            $rcvRst = $rm[1];
+            $rcvNo = trim($rm[2]);
+        }
+
+        return [
+            'date'     => $date,
+            'time'     => $time,
+            'band'     => $band,
+            'mode'     => $mode,
+            'callsign' => $callsign,
+            'sentRst'  => $sentRst,
+            'sentNo'   => $sentNo,
+            'rcvRst'   => $rcvRst,
+            'rcvNo'    => $rcvNo,
+            'mlt'      => $mlt,
+            'pts'      => $pts,
+        ];
     }
 }
