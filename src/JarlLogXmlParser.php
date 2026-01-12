@@ -214,25 +214,28 @@ class JarlLogXmlParser
         $callsign = $get('callsign');
         $sent = $get('sent');
 
-        // RCVの取得
+        // SENT+RCVの取得（CTESTWIN/HLTST両方で日本語文字により固定幅抽出がずれるため、一括パターンで抽出）
         $rcv = '';
-        if (isset($columns['rcv'])) {
-            // CTESTWIN形式: RCVカラムが定義されている場合は固定幅で取得
-            $rcv = $get('rcv');
-        } elseif (isset($columns['sent'])) {
-            // HLTST形式: SENTとRCVが連続、末尾にMulti/PTが含まれている可能性
-            // 末尾抽出では日本語名にMulti記号がくっついた場合に誤認識するため、一括パターンで抽出
+        if (isset($columns['sent'])) {
             $combined = trim(self::extractByDisplayWidth($line, $columns['sent']['start'], 100));
             
             // パターン1: [SENT_RST][sp][SENT_Name][RCV_RST][sp][RCV_Name][Multi][sp][PT]
-            // 例: "59  いたばし59  やまぐち-      1"
+            // 例: "59  いたばし59  やまぐち-      1" または "58 おぐら   59 ぐんじ             1"
             if (preg_match('/^([+-]?\d{2,3})\s+(.+?)([+-]?\d{2,3})\s+(.+?)([-*]|\d{1,3})\s+(\d+)\s*$/u', $combined, $splitMatch)) {
                 $sent = $splitMatch[1] . '  ' . trim($splitMatch[2]);
                 $rcv = $splitMatch[3] . '  ' . trim($splitMatch[4]);
                 $mlt = $splitMatch[5];
                 $pts = $splitMatch[6];
             }
-            // パターン2: Multi/PTが既に末尾抽出されている場合（スペース区切りあり）
+            // パターン2: Multiが空でPTのみ（CTESTWIN形式でMulti空欄の場合）
+            // 例: "58 おぐら   59 ぐんじ             1"
+            elseif (preg_match('/^([+-]?\d{2,3})\s+(.+?)([+-]?\d{2,3})\s+(\S+)\s+(\d+)\s*$/u', $combined, $splitMatch)) {
+                $sent = $splitMatch[1] . '  ' . trim($splitMatch[2]);
+                $rcv = $splitMatch[3] . '  ' . trim($splitMatch[4]);
+                $mlt = '';
+                $pts = $splitMatch[5];
+            }
+            // パターン3: Multi/PTがスペース区切りの場合
             elseif (preg_match('/^([+-]?\d{2,3})\s+(.+?)([+-]?\d{2,3})\s+(.+)$/u', $combined, $splitMatch)) {
                 $sent = $splitMatch[1] . '  ' . trim($splitMatch[2]);
                 $rcv = $splitMatch[3] . '  ' . trim($splitMatch[4]);
